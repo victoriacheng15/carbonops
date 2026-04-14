@@ -82,7 +82,7 @@ enum EnergySource {
 impl EnergySource {
     fn as_str(self) -> &'static str {
         match self {
-            EnergySource::Estimated => "estimated",
+            EnergySource::Estimated => "estimated_cpu_model",
             EnergySource::MeasuredKepler => "measured_kepler",
         }
     }
@@ -94,9 +94,12 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Detect => {
-            let client = Client::try_default().await?;
+            let client = Client::try_default()
+                .await
+                .context("connect to Kubernetes using the current kubeconfig")?;
             let detection = detect_telemetry(client).await?;
             print_detection(&detection);
+            print_telemetry_notes(&detection, None);
         }
         Commands::Collect {
             namespace,
@@ -120,7 +123,9 @@ async fn main() -> Result<()> {
 }
 
 async fn collect(namespace: Option<&str>, config: EstimateConfig) -> Result<()> {
-    let client = Client::try_default().await?;
+    let client = Client::try_default()
+        .await
+        .context("connect to Kubernetes using the current kubeconfig")?;
     let detection = detect_telemetry(client.clone()).await?;
     let measured_node_watts = if matches!(detection.energy_source, EnergySource::MeasuredKepler) {
         match detection.prometheus_target.as_deref() {
@@ -136,13 +141,9 @@ async fn collect(namespace: Option<&str>, config: EstimateConfig) -> Result<()> 
     let pod_nodes = collect_pod_nodes(client.clone(), namespace).await?;
     let metrics = collect_pod_metrics(client, namespace, &pod_nodes).await?;
 
-    print_impact_estimate(
-        &metrics,
-        &node_allocatable,
-        &measured_node_watts,
-        config,
-        detection.energy_source,
-    );
+    print_telemetry_summary(&detection);
+    print_telemetry_notes(&detection, Some(&measured_node_watts));
+    print_impact_per_hour(&metrics, &node_allocatable, &measured_node_watts, config);
     print_current_metrics(&metrics);
 
     Ok(())
@@ -151,8 +152,14 @@ async fn collect(namespace: Option<&str>, config: EstimateConfig) -> Result<()> 
 async fn detect_telemetry(client: Client) -> Result<TelemetryDetection> {
     let services: Api<Service> = Api::all(client.clone());
     let pods: Api<Pod> = Api::all(client.clone());
-    let service_list = services.list(&ListParams::default()).await?;
-    let pod_list = pods.list(&ListParams::default()).await?;
+    let service_list = services
+        .list(&ListParams::default())
+        .await
+        .context("list Kubernetes services while detecting Prometheus and Kepler")?;
+    let pod_list = pods
+        .list(&ListParams::default())
+        .await
+        .context("list Kubernetes pods while detecting Prometheus and Kepler")?;
 
     let mut prometheus_services: Vec<_> = service_list
         .iter()
@@ -399,11 +406,85 @@ fn print_detection(detection: &TelemetryDetection) {
     );
 }
 
+fn print_telemetry_summary(detection: &TelemetryDetection) {
+    let rows = vec![vec![
+        detection.prometheus_found.to_string(),
+        detection.kepler_found.to_string(),
+        detection.kepler_metrics_queryable.to_string(),
+        detection.energy_source.as_str().to_string(),
+    ]];
+
+    print_table(
+        "carbonops telemetry",
+        &["prometheus", "kepler", "kepler_queryable", "energy_mode"],
+        &rows,
+    );
+}
+
+fn print_telemetry_notes(
+    detection: &TelemetryDetection,
+    measured_node_watts: Option<&HashMap<String, f64>>,
+) {
+    let mut rows = Vec::new();
+
+    if !detection.prometheus_found {
+        rows.push(vec![
+            "warning".to_string(),
+            "Prometheus was not found. CarbonOps will use estimated_cpu_model energy.".to_string(),
+        ]);
+    } else if detection.prometheus_target.is_none() {
+        rows.push(vec![
+            "warning".to_string(),
+            "Prometheus was found, but no queryable service target was selected.".to_string(),
+        ]);
+    }
+
+    if !detection.kepler_found {
+        rows.push(vec![
+            "warning".to_string(),
+            "Kepler was not found. CarbonOps cannot use measured node energy.".to_string(),
+        ]);
+    }
+
+    if detection.prometheus_found && detection.kepler_found && !detection.kepler_metrics_queryable {
+        rows.push(vec![
+            "warning".to_string(),
+            "Prometheus and Kepler were found, but Kepler metrics were not queryable.".to_string(),
+        ]);
+    }
+
+    if matches!(detection.energy_source, EnergySource::Estimated) {
+        rows.push(vec![
+            "info".to_string(),
+            "Measured energy is unavailable. Impact rows will use estimated_cpu_model.".to_string(),
+        ]);
+    }
+
+    if matches!(detection.energy_source, EnergySource::MeasuredKepler)
+        && measured_node_watts.is_some_and(HashMap::is_empty)
+    {
+        rows.push(vec![
+            "warning".to_string(),
+            "Kepler was queryable, but no node watts were returned. Node rows will fall back to estimated_cpu_model.".to_string(),
+        ]);
+    }
+
+    if rows.is_empty() {
+        return;
+    }
+
+    print_table("\ncarbonops telemetry notes", &["level", "message"], &rows);
+}
+
 async fn collect_node_allocatable_cpu(client: Client) -> Result<HashMap<String, f64>> {
     let nodes: Api<Node> = Api::all(client);
     let mut node_allocatable = HashMap::new();
 
-    for node in nodes.list(&ListParams::default()).await? {
+    for node in nodes
+        .list(&ListParams::default())
+        .await
+        .context("list Kubernetes nodes for allocatable CPU")?
+    {
         let name = object_name(&node.metadata.name);
         let cpu = node
             .status
@@ -430,7 +511,11 @@ async fn collect_pod_nodes(
     };
 
     let mut pod_nodes = HashMap::new();
-    for pod in pods.list(&ListParams::default()).await? {
+    for pod in pods
+        .list(&ListParams::default())
+        .await
+        .context("list Kubernetes pods for pod-to-node placement")?
+    {
         let namespace = object_namespace(&pod.metadata.namespace);
         let name = object_name(&pod.metadata.name);
         let node = pod
@@ -458,7 +543,11 @@ async fn collect_pod_metrics(
 
     let mut metrics = Vec::new();
 
-    for metric in api.list(&ListParams::default()).await? {
+    for metric in api
+        .list(&ListParams::default())
+        .await
+        .context("read Kubernetes Metrics API pod metrics; verify metrics-server is installed and RBAC allows pod metrics")?
+    {
         let metric_namespace = object_namespace(&metric.metadata.namespace).to_string();
         let pod = object_name(&metric.metadata.name).to_string();
         let node = pod_nodes
@@ -490,12 +579,11 @@ async fn collect_pod_metrics(
     Ok(metrics)
 }
 
-fn print_impact_estimate(
+fn print_impact_per_hour(
     metrics: &[ContainerMetric],
     node_allocatable: &HashMap<String, f64>,
     measured_node_watts: &HashMap<String, f64>,
     config: EstimateConfig,
-    energy_source: EnergySource,
 ) {
     let mut cpu_by_node: HashMap<&str, f64> = HashMap::new();
     for metric in metrics {
@@ -507,6 +595,8 @@ fn print_impact_estimate(
     let mut total_kwh_per_hour = 0.0;
     let mut total_cad_per_hour = 0.0;
     let mut total_gco2e_per_hour = 0.0;
+    let mut measured_rows = 0;
+    let mut estimated_rows = 0;
 
     for (node, cpu_millicores) in cpu_by_node {
         let allocatable_millicores = node_allocatable.get(node).copied().unwrap_or_default();
@@ -515,10 +605,20 @@ fn print_impact_estimate(
         } else {
             0.0
         };
-        let watts = measured_node_watts.get(node).copied().unwrap_or_else(|| {
-            config.node_idle_watts
-                + ((config.node_max_watts - config.node_idle_watts) * cpu_utilization)
-        });
+        let (energy_source, watts) = match measured_node_watts.get(node).copied() {
+            Some(watts) => {
+                measured_rows += 1;
+                (EnergySource::MeasuredKepler, watts)
+            }
+            None => {
+                estimated_rows += 1;
+                (
+                    EnergySource::Estimated,
+                    config.node_idle_watts
+                        + ((config.node_max_watts - config.node_idle_watts) * cpu_utilization),
+                )
+            }
+        };
         let kwh_per_hour = watts / 1000.0;
         let cad_per_hour = kwh_per_hour * config.electricity_cad_per_kwh;
         let gco2e_per_hour = kwh_per_hour * config.carbon_gco2e_per_kwh;
@@ -541,8 +641,14 @@ fn print_impact_estimate(
         ]);
     }
 
+    let total_energy_source = match (measured_rows > 0, estimated_rows > 0) {
+        (true, true) => "mixed",
+        (true, false) => EnergySource::MeasuredKepler.as_str(),
+        _ => EnergySource::Estimated.as_str(),
+    };
+
     rows.push(vec![
-        energy_source.as_str().to_string(),
+        total_energy_source.to_string(),
         "total".to_string(),
         String::new(),
         String::new(),
@@ -554,7 +660,7 @@ fn print_impact_estimate(
     ]);
 
     print_table(
-        "carbonops estimated impact per hour",
+        "\ncarbonops impact per hour",
         &[
             "energy_source",
             "node",
