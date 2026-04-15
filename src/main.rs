@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use k8s_openapi::api::core::v1::{Node, Pod, Service};
 use kube::{
@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, fs, path::PathBuf};
+
+#[cfg(test)]
+mod tests;
 
 #[derive(Debug, Parser)]
 #[command(name = "carbonops")]
@@ -29,6 +32,10 @@ enum Commands {
         /// Limit pod inventory and pod metrics to one namespace.
         #[arg(short, long)]
         namespace: Option<String>,
+
+        /// Collect pod inventory and pod metrics across all namespaces.
+        #[arg(long)]
+        all_namespaces: bool,
 
         /// Read estimate assumptions from a TOML config file.
         #[arg(long)]
@@ -50,6 +57,14 @@ enum Commands {
         #[arg(long)]
         carbon_gco2e_per_kwh: Option<f64>,
 
+        /// Limit workload metric rows after sorting by the selected top dimension.
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Sort workload metric rows by the selected top dimension.
+        #[arg(long, value_enum, default_value_t = TopMetric::Cpu)]
+        top: TopMetric,
+
         /// Output format for the collection snapshot.
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
@@ -60,6 +75,14 @@ enum Commands {
 enum OutputFormat {
     Table,
     Json,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TopMetric {
+    Cpu,
+    Memory,
+    Cost,
+    Carbon,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -98,6 +121,8 @@ struct ContainerMetric {
     #[serde(rename = "cpu_mcores")]
     cpu_millicores: f64,
     memory_mib: f64,
+    estimated_cad_per_hour: f64,
+    estimated_gco2e_g_per_hour: f64,
 }
 
 #[derive(Debug)]
@@ -177,13 +202,17 @@ async fn main() -> Result<()> {
         }
         Commands::Collect {
             namespace,
+            all_namespaces,
             config,
             node_idle_watts,
             node_max_watts,
             electricity_cad_per_kwh,
             carbon_gco2e_per_kwh,
+            limit,
+            top,
             output,
         } => {
+            let namespace = resolve_collection_namespace(namespace, all_namespaces)?;
             let config = load_estimate_config(
                 config,
                 EstimateConfigOverrides {
@@ -194,11 +223,27 @@ async fn main() -> Result<()> {
                 },
             )?;
 
-            collect(namespace.as_deref(), config, output).await?
+            collect(namespace.as_deref(), config, limit, top, output).await?
         }
     }
 
     Ok(())
+}
+
+fn resolve_collection_namespace(
+    namespace: Option<String>,
+    all_namespaces: bool,
+) -> Result<Option<String>> {
+    match (namespace, all_namespaces) {
+        (Some(_), true) => {
+            bail!("use either --namespace <name> or --all-namespaces, not both")
+        }
+        (Some(namespace), false) => Ok(Some(namespace)),
+        (None, true) => Ok(None),
+        (None, false) => {
+            bail!("provide --namespace <name> or --all-namespaces for collection")
+        }
+    }
 }
 
 fn load_estimate_config(
@@ -234,6 +279,8 @@ fn load_estimate_config(
 async fn collect(
     namespace: Option<&str>,
     config: EstimateConfig,
+    limit: Option<usize>,
+    top: TopMetric,
     output: OutputFormat,
 ) -> Result<()> {
     let client = Client::try_default()
@@ -259,6 +306,8 @@ async fn collect(
         node_allocatable,
         measured_node_watts,
         metrics,
+        limit,
+        top,
     )?;
 
     match output {
@@ -703,6 +752,8 @@ async fn collect_pod_metrics(
                     cpu_millicores: parse_cpu_millicores(metric_value(usage, "cpu"))
                         .unwrap_or_default(),
                     memory_mib: parse_memory_mib(metric_value(usage, "memory")).unwrap_or_default(),
+                    estimated_cad_per_hour: 0.0,
+                    estimated_gco2e_g_per_hour: 0.0,
                 });
             }
         }
@@ -717,6 +768,8 @@ fn build_collection_report(
     node_allocatable: HashMap<String, f64>,
     measured_node_watts: HashMap<String, f64>,
     metrics: Vec<ContainerMetric>,
+    workload_limit: Option<usize>,
+    top: TopMetric,
 ) -> Result<CollectionReport> {
     let collected_at_unix_seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -725,6 +778,8 @@ fn build_collection_report(
     let telemetry_notes = telemetry_notes(&detection, Some(&measured_node_watts));
     let node_impact_per_hour =
         build_impact_rows(&metrics, &node_allocatable, &measured_node_watts, config);
+    let workload_metrics = build_workload_metric_rows(metrics, &node_impact_per_hour);
+    let workload_metrics = sort_and_limit_workload_metrics(workload_metrics, top, workload_limit);
 
     Ok(CollectionReport {
         collected_at_unix_seconds,
@@ -738,8 +793,67 @@ fn build_collection_report(
         telemetry_notes,
         assumptions: config,
         node_impact_per_hour,
-        workload_metrics: metrics,
+        workload_metrics,
     })
+}
+
+fn build_workload_metric_rows(
+    mut metrics: Vec<ContainerMetric>,
+    impact_rows: &[ImpactRow],
+) -> Vec<ContainerMetric> {
+    let cpu_by_node = cpu_by_node(&metrics);
+    let impact_by_node: HashMap<&str, &ImpactRow> = impact_rows
+        .iter()
+        .filter(|row| row.node != "total")
+        .map(|row| (row.node.as_str(), row))
+        .collect();
+
+    for metric in &mut metrics {
+        let node_cpu = cpu_by_node
+            .get(metric.node.as_str())
+            .copied()
+            .unwrap_or_default();
+        let Some(node_impact) = impact_by_node.get(metric.node.as_str()) else {
+            continue;
+        };
+
+        if node_cpu > 0.0 {
+            let cpu_share = metric.cpu_millicores / node_cpu;
+            metric.estimated_cad_per_hour = node_impact.cad_per_hour * cpu_share;
+            metric.estimated_gco2e_g_per_hour = node_impact.gco2e_g_per_hour * cpu_share;
+        }
+    }
+
+    metrics
+}
+
+fn sort_and_limit_workload_metrics(
+    mut metrics: Vec<ContainerMetric>,
+    top: TopMetric,
+    limit: Option<usize>,
+) -> Vec<ContainerMetric> {
+    metrics.sort_by(|left, right| {
+        top_metric_value(right, top)
+            .total_cmp(&top_metric_value(left, top))
+            .then_with(|| left.namespace.cmp(&right.namespace))
+            .then_with(|| left.pod.cmp(&right.pod))
+            .then_with(|| left.container.cmp(&right.container))
+    });
+
+    if let Some(limit) = limit {
+        metrics.truncate(limit);
+    }
+
+    metrics
+}
+
+fn top_metric_value(metric: &ContainerMetric, top: TopMetric) -> f64 {
+    match top {
+        TopMetric::Cpu => metric.cpu_millicores,
+        TopMetric::Memory => metric.memory_mib,
+        TopMetric::Cost => metric.estimated_cad_per_hour,
+        TopMetric::Carbon => metric.estimated_gco2e_g_per_hour,
+    }
 }
 
 fn build_impact_rows(
@@ -748,10 +862,7 @@ fn build_impact_rows(
     measured_node_watts: &HashMap<String, f64>,
     config: EstimateConfig,
 ) -> Vec<ImpactRow> {
-    let mut cpu_by_node: HashMap<&str, f64> = HashMap::new();
-    for metric in metrics {
-        *cpu_by_node.entry(&metric.node).or_default() += metric.cpu_millicores;
-    }
+    let cpu_by_node = cpu_by_node(metrics);
 
     let mut rows = Vec::new();
     let mut total_watts = 0.0;
@@ -762,16 +873,16 @@ fn build_impact_rows(
     let mut estimated_rows = 0;
 
     let mut node_usage: Vec<_> = cpu_by_node.into_iter().collect();
-    node_usage.sort_by_key(|(node, _)| *node);
+    node_usage.sort_by(|(left, _), (right, _)| left.cmp(right));
 
     for (node, cpu_millicores) in node_usage {
-        let allocatable_millicores = node_allocatable.get(node).copied().unwrap_or_default();
+        let allocatable_millicores = node_allocatable.get(&node).copied().unwrap_or_default();
         let cpu_utilization = if allocatable_millicores > 0.0 {
             (cpu_millicores / allocatable_millicores).clamp(0.0, 1.0)
         } else {
             0.0
         };
-        let (energy_source, watts) = match measured_node_watts.get(node).copied() {
+        let (energy_source, watts) = match measured_node_watts.get(&node).copied() {
             Some(watts) => {
                 measured_rows += 1;
                 (EnergySource::MeasuredKepler, watts)
@@ -796,7 +907,7 @@ fn build_impact_rows(
 
         rows.push(ImpactRow {
             energy_source: energy_source.as_str().to_string(),
-            node: node.to_string(),
+            node,
             cpu_mcores: Some(cpu_millicores),
             alloc_mcores: Some(allocatable_millicores),
             cpu_pct: Some(cpu_utilization * 100.0),
@@ -826,6 +937,15 @@ fn build_impact_rows(
     });
 
     rows
+}
+
+fn cpu_by_node(metrics: &[ContainerMetric]) -> HashMap<String, f64> {
+    let mut cpu_by_node = HashMap::new();
+    for metric in metrics {
+        *cpu_by_node.entry(metric.node.clone()).or_default() += metric.cpu_millicores;
+    }
+
+    cpu_by_node
 }
 
 fn print_collection_report(report: &CollectionReport) {
@@ -902,6 +1022,8 @@ fn print_current_metrics(metrics: &[ContainerMetric]) {
                 metric.container.clone(),
                 format!("{:.2}", metric.cpu_millicores),
                 format!("{:.2}", metric.memory_mib),
+                format!("{:.4}", metric.estimated_cad_per_hour),
+                format!("{:.2}", metric.estimated_gco2e_g_per_hour),
             ]
         })
         .collect();
@@ -915,6 +1037,8 @@ fn print_current_metrics(metrics: &[ContainerMetric]) {
             "container",
             "cpu_mcores",
             "memory_mib",
+            "est_cad_per_hr",
+            "est_gco2e_g_per_hr",
         ],
         &rows,
     );
@@ -1024,187 +1148,4 @@ fn print_table_separator(widths: &[usize]) {
         print!("|-{}-", "-".repeat(*width));
     }
     println!("|");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn assert_close(actual: f64, expected: f64) {
-        let delta = (actual - expected).abs();
-        assert!(
-            delta < 0.0001,
-            "expected {actual} to be within 0.0001 of {expected}"
-        );
-    }
-
-    #[test]
-    fn parses_cpu_quantities_as_millicores() {
-        assert_close(parse_cpu_millicores("250m").unwrap(), 250.0);
-        assert_close(parse_cpu_millicores("2").unwrap(), 2000.0);
-        assert_close(parse_cpu_millicores("1500000u").unwrap(), 1500.0);
-        assert_close(parse_cpu_millicores("250000000n").unwrap(), 250.0);
-        assert!(parse_cpu_millicores("bad").is_none());
-    }
-
-    #[test]
-    fn parses_memory_quantities_as_mib() {
-        assert_close(parse_memory_mib("128Mi").unwrap(), 128.0);
-        assert_close(parse_memory_mib("1Gi").unwrap(), 1024.0);
-        assert_close(parse_memory_mib("1048576").unwrap(), 1.0);
-        assert!(parse_memory_mib("bad").is_none());
-    }
-
-    #[test]
-    fn telemetry_notes_explain_estimated_fallback() {
-        let detection = TelemetryDetection {
-            prometheus_found: false,
-            kepler_found: false,
-            kepler_metrics_queryable: false,
-            prometheus_target: None,
-            energy_source: EnergySource::Estimated,
-        };
-
-        let notes = telemetry_notes(&detection, None);
-
-        assert_eq!(notes.len(), 3);
-        assert_eq!(notes[0].level, "warning");
-        assert!(notes[0].message.contains("Prometheus was not found"));
-        assert!(notes[1].message.contains("Kepler was not found"));
-        assert!(notes[2].message.contains("Measured energy is unavailable"));
-    }
-
-    #[test]
-    fn impact_rows_use_estimated_power_and_total_row() {
-        let metrics = vec![ContainerMetric {
-            node: "node-a".to_string(),
-            namespace: "kube-system".to_string(),
-            pod: "coredns".to_string(),
-            container: "coredns".to_string(),
-            cpu_millicores: 1000.0,
-            memory_mib: 64.0,
-        }];
-        let node_allocatable = HashMap::from([("node-a".to_string(), 2000.0)]);
-        let measured_node_watts = HashMap::new();
-        let config = EstimateConfig {
-            node_idle_watts: 50.0,
-            node_max_watts: 180.0,
-            electricity_cad_per_kwh: 0.20,
-            carbon_gco2e_per_kwh: 400.0,
-        };
-
-        let rows = build_impact_rows(&metrics, &node_allocatable, &measured_node_watts, config);
-
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].energy_source, "estimated_cpu_model");
-        assert_eq!(rows[0].node, "node-a");
-        assert_close(rows[0].cpu_mcores.unwrap(), 1000.0);
-        assert_close(rows[0].alloc_mcores.unwrap(), 2000.0);
-        assert_close(rows[0].cpu_pct.unwrap(), 50.0);
-        assert_close(rows[0].watts, 115.0);
-        assert_close(rows[0].kwh_per_hour, 0.115);
-        assert_close(rows[0].cad_per_hour, 0.023);
-        assert_close(rows[0].gco2e_g_per_hour, 46.0);
-
-        assert_eq!(rows[1].node, "total");
-        assert_eq!(rows[1].energy_source, "estimated_cpu_model");
-        assert!(rows[1].cpu_mcores.is_none());
-        assert_close(rows[1].watts, 115.0);
-    }
-
-    #[test]
-    fn impact_rows_mark_mixed_totals_when_measured_and_estimated_are_present() {
-        let metrics = vec![
-            ContainerMetric {
-                node: "node-a".to_string(),
-                namespace: "default".to_string(),
-                pod: "app-a".to_string(),
-                container: "app".to_string(),
-                cpu_millicores: 500.0,
-                memory_mib: 32.0,
-            },
-            ContainerMetric {
-                node: "node-b".to_string(),
-                namespace: "default".to_string(),
-                pod: "app-b".to_string(),
-                container: "app".to_string(),
-                cpu_millicores: 500.0,
-                memory_mib: 32.0,
-            },
-        ];
-        let node_allocatable = HashMap::from([
-            ("node-a".to_string(), 2000.0),
-            ("node-b".to_string(), 2000.0),
-        ]);
-        let measured_node_watts = HashMap::from([("node-b".to_string(), 42.0)]);
-        let config = EstimateConfig {
-            node_idle_watts: 50.0,
-            node_max_watts: 180.0,
-            electricity_cad_per_kwh: 0.20,
-            carbon_gco2e_per_kwh: 400.0,
-        };
-
-        let rows = build_impact_rows(&metrics, &node_allocatable, &measured_node_watts, config);
-
-        assert_eq!(rows[0].node, "node-a");
-        assert_eq!(rows[0].energy_source, "estimated_cpu_model");
-        assert_eq!(rows[1].node, "node-b");
-        assert_eq!(rows[1].energy_source, "measured_kepler");
-        assert_eq!(rows[2].node, "total");
-        assert_eq!(rows[2].energy_source, "mixed");
-    }
-
-    #[test]
-    fn json_uses_human_readable_cpu_field_name() {
-        let metric = ContainerMetric {
-            node: "node-a".to_string(),
-            namespace: "default".to_string(),
-            pod: "app".to_string(),
-            container: "app".to_string(),
-            cpu_millicores: 12.5,
-            memory_mib: 64.0,
-        };
-
-        let value = serde_json::to_value(metric).unwrap();
-
-        assert_eq!(value["cpu_mcores"], 12.5);
-        assert!(value.get("cpu_millicores").is_none());
-    }
-
-    #[test]
-    fn parses_estimate_config_from_toml() {
-        let config: EstimateConfig = toml::from_str(
-            r#"
-node_idle_watts = 55.0
-node_max_watts = 160.0
-electricity_cad_per_kwh = 0.18
-carbon_gco2e_per_kwh = 35.0
-"#,
-        )
-        .unwrap();
-
-        assert_close(config.node_idle_watts, 55.0);
-        assert_close(config.node_max_watts, 160.0);
-        assert_close(config.electricity_cad_per_kwh, 0.18);
-        assert_close(config.carbon_gco2e_per_kwh, 35.0);
-    }
-
-    #[test]
-    fn cli_assumption_overrides_apply_to_default_config() {
-        let config = load_estimate_config(
-            None,
-            EstimateConfigOverrides {
-                node_idle_watts: Some(60.0),
-                node_max_watts: None,
-                electricity_cad_per_kwh: Some(0.25),
-                carbon_gco2e_per_kwh: None,
-            },
-        )
-        .unwrap();
-
-        assert_close(config.node_idle_watts, 60.0);
-        assert_close(config.node_max_watts, 180.0);
-        assert_close(config.electricity_cad_per_kwh, 0.25);
-        assert_close(config.carbon_gco2e_per_kwh, 400.0);
-    }
 }

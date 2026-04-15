@@ -9,6 +9,7 @@ Cost, energy, and carbon values are estimates unless measured telemetry is avail
 ## Milestones
 
 - Validated local Kubernetes with Prometheus/Kepler and AKS without Prometheus/Kepler, proving CarbonOps can use measured energy telemetry when available and fall back to an estimated CPU-based model when needed.
+- Added scoped collection and top-N workload ranking with `--namespace`, `--all-namespaces`, `--top cpu|memory|cost|carbon`, and `--limit`.
 
 Visual gallery: [`docs/visual-gallery`](docs/visual-gallery)
 
@@ -50,22 +51,38 @@ Run telemetry detection against the current Kubernetes context:
 cargo run -- detect
 ```
 
-Collect current metrics and impact estimates:
-
-```bash
-cargo run -- collect
-```
-
-Limit collection to one namespace:
+Collect current metrics and impact estimates for one namespace:
 
 ```bash
 cargo run -- collect --namespace kube-system
 ```
 
+Collect across all namespaces explicitly:
+
+```bash
+cargo run -- collect --all-namespaces
+```
+
+Limit and sort workload rows:
+
+```bash
+cargo run -- collect --namespace kube-system --top cpu --limit 20
+cargo run -- collect --namespace kube-system --top memory --limit 20
+cargo run -- collect --namespace kube-system --top carbon --limit 20
+cargo run -- collect --all-namespaces --top cost --limit 50
+```
+
+Write a structured JSON snapshot:
+
+```bash
+cargo run -- collect --namespace kube-system --output json
+cargo run -- collect --namespace kube-system --top carbon --limit 20 --output json
+```
+
 Adjust local assumptions:
 
 ```bash
-cargo run -- collect \
+cargo run -- collect --namespace kube-system \
   --node-idle-watts 50 \
   --node-max-watts 180 \
   --electricity-cad-per-kwh 0.20 \
@@ -75,7 +92,7 @@ cargo run -- collect \
 Use a config file for estimate assumptions:
 
 ```bash
-cargo run -- collect --config carbonops.example.toml
+cargo run -- collect --namespace kube-system --config carbonops.example.toml
 ```
 
 CLI assumption flags override config values when both are provided.
@@ -107,15 +124,13 @@ KUBECONFIG=./tofu/kubeconfig-aks-carbonops cargo run -- collect --namespace kube
 
 Near-term:
 
-- require namespace-scoped collection by default for safer cloud testing
-- add explicit `--all-namespaces` for full-cluster collection
-- add top-N views for the highest cost, energy, carbon, CPU, or memory contributors
-- add JSON output for future dashboard and automation use
 - continue validating against small AKS clusters
+- store historical JSON snapshots for baseline analysis
+- compare current namespace or workload usage against recent baseline history
+- flag cost, energy, carbon, CPU, or memory anomalies
 
 Longer-term:
 
-- store historical snapshots
 - calculate baseline usage by namespace, workload, node, or team
 - compare current usage against baseline history
 - flag cost, energy, or carbon anomalies
