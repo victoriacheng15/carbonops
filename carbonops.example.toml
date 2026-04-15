@@ -1,0 +1,4 @@
+node_idle_watts = 50.0
+node_max_watts = 180.0
+electricity_cad_per_kwh = 0.20
+carbon_gco2e_per_kwh = 400.0

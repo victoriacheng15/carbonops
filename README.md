@@ -72,6 +72,14 @@ cargo run -- collect \
   --carbon-gco2e-per-kwh 400
 ```
 
+Use a config file for estimate assumptions:
+
+```bash
+cargo run -- collect --config carbonops.example.toml
+```
+
+CLI assumption flags override config values when both are provided.
+
 ## AKS Testing
 
 For AKS testing, use a separate kubeconfig file so the project does not modify the default `~/.kube/config`:
