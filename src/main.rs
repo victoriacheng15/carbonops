@@ -6,10 +6,10 @@ use kube::{
     api::{Api, DynamicObject, ListParams},
     core::{ApiResource, GroupVersionKind},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{collections::HashMap, fs, path::PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(name = "carbonops")]
@@ -30,21 +30,25 @@ enum Commands {
         #[arg(short, long)]
         namespace: Option<String>,
 
+        /// Read estimate assumptions from a TOML config file.
+        #[arg(long)]
+        config: Option<PathBuf>,
+
         /// Estimated idle power draw per node in watts.
-        #[arg(long, default_value_t = 50.0)]
-        node_idle_watts: f64,
+        #[arg(long)]
+        node_idle_watts: Option<f64>,
 
         /// Estimated max power draw per node in watts.
-        #[arg(long, default_value_t = 180.0)]
-        node_max_watts: f64,
+        #[arg(long)]
+        node_max_watts: Option<f64>,
 
         /// Electricity price in CAD per kWh.
-        #[arg(long, default_value_t = 0.20)]
-        electricity_cad_per_kwh: f64,
+        #[arg(long)]
+        electricity_cad_per_kwh: Option<f64>,
 
         /// Carbon intensity in grams CO2e per kWh.
-        #[arg(long, default_value_t = 400.0)]
-        carbon_gco2e_per_kwh: f64,
+        #[arg(long)]
+        carbon_gco2e_per_kwh: Option<f64>,
 
         /// Output format for the collection snapshot.
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
@@ -58,12 +62,31 @@ enum OutputFormat {
     Json,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 struct EstimateConfig {
     node_idle_watts: f64,
     node_max_watts: f64,
     electricity_cad_per_kwh: f64,
     carbon_gco2e_per_kwh: f64,
+}
+
+impl Default for EstimateConfig {
+    fn default() -> Self {
+        Self {
+            node_idle_watts: 50.0,
+            node_max_watts: 180.0,
+            electricity_cad_per_kwh: 0.20,
+            carbon_gco2e_per_kwh: 400.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EstimateConfigOverrides {
+    node_idle_watts: Option<f64>,
+    node_max_watts: Option<f64>,
+    electricity_cad_per_kwh: Option<f64>,
+    carbon_gco2e_per_kwh: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -154,24 +177,58 @@ async fn main() -> Result<()> {
         }
         Commands::Collect {
             namespace,
+            config,
             node_idle_watts,
             node_max_watts,
             electricity_cad_per_kwh,
             carbon_gco2e_per_kwh,
             output,
         } => {
-            let config = EstimateConfig {
-                node_idle_watts,
-                node_max_watts,
-                electricity_cad_per_kwh,
-                carbon_gco2e_per_kwh,
-            };
+            let config = load_estimate_config(
+                config,
+                EstimateConfigOverrides {
+                    node_idle_watts,
+                    node_max_watts,
+                    electricity_cad_per_kwh,
+                    carbon_gco2e_per_kwh,
+                },
+            )?;
 
             collect(namespace.as_deref(), config, output).await?
         }
     }
 
     Ok(())
+}
+
+fn load_estimate_config(
+    config_path: Option<PathBuf>,
+    overrides: EstimateConfigOverrides,
+) -> Result<EstimateConfig> {
+    let mut config = match config_path {
+        Some(path) => {
+            let content = fs::read_to_string(&path)
+                .with_context(|| format!("read estimate config from {}", path.display()))?;
+            toml::from_str::<EstimateConfig>(&content)
+                .with_context(|| format!("parse estimate config from {}", path.display()))?
+        }
+        None => EstimateConfig::default(),
+    };
+
+    if let Some(value) = overrides.node_idle_watts {
+        config.node_idle_watts = value;
+    }
+    if let Some(value) = overrides.node_max_watts {
+        config.node_max_watts = value;
+    }
+    if let Some(value) = overrides.electricity_cad_per_kwh {
+        config.electricity_cad_per_kwh = value;
+    }
+    if let Some(value) = overrides.carbon_gco2e_per_kwh {
+        config.carbon_gco2e_per_kwh = value;
+    }
+
+    Ok(config)
 }
 
 async fn collect(
@@ -1112,5 +1169,42 @@ mod tests {
 
         assert_eq!(value["cpu_mcores"], 12.5);
         assert!(value.get("cpu_millicores").is_none());
+    }
+
+    #[test]
+    fn parses_estimate_config_from_toml() {
+        let config: EstimateConfig = toml::from_str(
+            r#"
+node_idle_watts = 55.0
+node_max_watts = 160.0
+electricity_cad_per_kwh = 0.18
+carbon_gco2e_per_kwh = 35.0
+"#,
+        )
+        .unwrap();
+
+        assert_close(config.node_idle_watts, 55.0);
+        assert_close(config.node_max_watts, 160.0);
+        assert_close(config.electricity_cad_per_kwh, 0.18);
+        assert_close(config.carbon_gco2e_per_kwh, 35.0);
+    }
+
+    #[test]
+    fn cli_assumption_overrides_apply_to_default_config() {
+        let config = load_estimate_config(
+            None,
+            EstimateConfigOverrides {
+                node_idle_watts: Some(60.0),
+                node_max_watts: None,
+                electricity_cad_per_kwh: Some(0.25),
+                carbon_gco2e_per_kwh: None,
+            },
+        )
+        .unwrap();
+
+        assert_close(config.node_idle_watts, 60.0);
+        assert_close(config.node_max_watts, 180.0);
+        assert_close(config.electricity_cad_per_kwh, 0.25);
+        assert_close(config.carbon_gco2e_per_kwh, 400.0);
     }
 }
