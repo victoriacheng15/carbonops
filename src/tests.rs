@@ -1,4 +1,6 @@
 use super::*;
+use rusqlite::Connection;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn assert_close(actual: f64, expected: f64) {
     let delta = (actual - expected).abs();
@@ -318,6 +320,7 @@ fn workload_limit_does_not_change_node_impact_totals() {
         node_allocatable,
         HashMap::new(),
         metrics,
+        Some("default"),
         Some(1),
         TopMetric::Cpu,
     )
@@ -326,4 +329,68 @@ fn workload_limit_does_not_change_node_impact_totals() {
     assert_eq!(report.workload_metrics.len(), 1);
     assert_eq!(report.workload_metrics[0].pod, "high");
     assert_close(report.node_impact_per_hour[0].cpu_mcores.unwrap(), 1000.0);
+}
+
+#[test]
+fn sqlite_storage_writes_snapshot_payload_and_metadata() {
+    let path = std::env::temp_dir().join(format!(
+        "carbonops-test-{}.sqlite",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let report = CollectionReport {
+        collected_at_unix_seconds: 1_700_000_000,
+        scope: CollectionScope {
+            namespace: Some("kube-system".to_string()),
+            all_namespaces: false,
+            top: "carbon".to_string(),
+            limit: Some(25),
+        },
+        telemetry: TelemetryReport {
+            prometheus: false,
+            kepler: false,
+            kepler_queryable: false,
+            prometheus_target: None,
+            energy_source: "estimated_cpu_model".to_string(),
+        },
+        telemetry_notes: Vec::new(),
+        assumptions: EstimateConfig::default(),
+        node_impact_per_hour: Vec::new(),
+        workload_metrics: Vec::new(),
+    };
+
+    sqlite::save_report(&path, &report).unwrap();
+
+    let connection = Connection::open(&path).unwrap();
+    let row = connection
+        .query_row(
+            "SELECT created_at, collected_at_unix_seconds, namespace, top, row_limit, energy_source, payload
+             FROM collection_snapshots",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            },
+        )
+        .unwrap();
+
+    assert!(!row.0.is_empty());
+    assert_eq!(row.1, 1_700_000_000);
+    assert_eq!(row.2, "kube-system");
+    assert_eq!(row.3, "carbon");
+    assert_eq!(row.4, 25);
+    assert_eq!(row.5, "estimated_cpu_model");
+    assert!(row.6.contains("\"scope\""));
+    assert!(row.6.contains("\"kube-system\""));
+
+    let _ = std::fs::remove_file(path);
 }
