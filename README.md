@@ -24,6 +24,30 @@ CarbonOps currently supports:
 - reading current CPU and memory usage from the Kubernetes Metrics API
 - calculating estimated kWh, CAD cost, and carbon impact per hour
 - showing the telemetry source used for each impact row
+- saving structured collection snapshots into SQLite for baseline experiments
+
+## Current Flow
+
+```mermaid
+flowchart TD
+    A[Kubernetes access] --> B[detect]
+    A --> C[collect]
+    C --> D[Kubernetes API]
+    C --> E[Metrics API]
+    C --> F[Prometheus and Kepler detection]
+    D --> G[Pods, nodes, namespaces, placement]
+    E --> H[CPU and memory usage]
+    F --> I{Measured energy available?}
+    I -->|yes| J[Kepler node watts]
+    I -->|no| K[Estimated CPU energy model]
+    G --> L[Collection snapshot]
+    H --> L
+    J --> L
+    K --> L
+    L --> M[Table output]
+    L --> N[JSON output]
+    L --> O[SQLite snapshot storage]
+```
 
 ## Requirements
 
@@ -79,6 +103,14 @@ cargo run -- collect --namespace kube-system --output json
 cargo run -- collect --namespace kube-system --top carbon --limit 20 --output json
 ```
 
+Save a snapshot into SQLite:
+
+```bash
+cargo run -- collect --namespace kube-system --top carbon --limit 20 --save-sqlite carbonops.sqlite
+```
+
+When `--save-sqlite` is used, CarbonOps stores the structured snapshot and does not print table or JSON output. This is an early prototype path for collecting history before baseline and anomaly analysis.
+
 Adjust local assumptions:
 
 ```bash
@@ -119,20 +151,3 @@ Then run CarbonOps with that kubeconfig:
 KUBECONFIG=./tofu/kubeconfig-aks-carbonops cargo run -- detect
 KUBECONFIG=./tofu/kubeconfig-aks-carbonops cargo run -- collect --namespace kube-system
 ```
-
-## Roadmap
-
-Near-term:
-
-- continue validating against small AKS clusters
-- store historical JSON snapshots for baseline analysis
-- compare current namespace or workload usage against recent baseline history
-- flag cost, energy, carbon, CPU, or memory anomalies
-
-Longer-term:
-
-- calculate baseline usage by namespace, workload, node, or team
-- compare current usage against baseline history
-- flag cost, energy, or carbon anomalies
-- send alerts through tools such as Grafana, Slack, Teams, or GitHub issues
-- package the collector as a Kubernetes workload through Helm
