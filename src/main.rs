@@ -14,6 +14,8 @@ use std::{collections::HashMap, fs, path::PathBuf};
 #[cfg(test)]
 mod tests;
 
+mod sqlite;
+
 #[derive(Debug, Parser)]
 #[command(name = "carbonops")]
 #[command(about = "Collect Kubernetes usage data for FinOps and carbon attribution experiments")]
@@ -68,6 +70,10 @@ enum Commands {
         /// Output format for the collection snapshot.
         #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
         output: OutputFormat,
+
+        /// Save the structured collection snapshot into a SQLite database.
+        #[arg(long)]
+        save_sqlite: Option<PathBuf>,
     },
 }
 
@@ -83,6 +89,17 @@ enum TopMetric {
     Memory,
     Cost,
     Carbon,
+}
+
+impl TopMetric {
+    fn as_str(self) -> &'static str {
+        match self {
+            TopMetric::Cpu => "cpu",
+            TopMetric::Memory => "memory",
+            TopMetric::Cost => "cost",
+            TopMetric::Carbon => "carbon",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
@@ -143,11 +160,20 @@ enum EnergySource {
 #[derive(Debug, Serialize)]
 struct CollectionReport {
     collected_at_unix_seconds: u64,
+    scope: CollectionScope,
     telemetry: TelemetryReport,
     telemetry_notes: Vec<TelemetryNote>,
     assumptions: EstimateConfig,
     node_impact_per_hour: Vec<ImpactRow>,
     workload_metrics: Vec<ContainerMetric>,
+}
+
+#[derive(Debug, Serialize)]
+struct CollectionScope {
+    namespace: Option<String>,
+    all_namespaces: bool,
+    top: String,
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -211,6 +237,7 @@ async fn main() -> Result<()> {
             limit,
             top,
             output,
+            save_sqlite,
         } => {
             let namespace = resolve_collection_namespace(namespace, all_namespaces)?;
             let config = load_estimate_config(
@@ -223,7 +250,15 @@ async fn main() -> Result<()> {
                 },
             )?;
 
-            collect(namespace.as_deref(), config, limit, top, output).await?
+            collect(
+                namespace.as_deref(),
+                config,
+                limit,
+                top,
+                output,
+                save_sqlite,
+            )
+            .await?
         }
     }
 
@@ -282,6 +317,7 @@ async fn collect(
     limit: Option<usize>,
     top: TopMetric,
     output: OutputFormat,
+    sqlite_path: Option<PathBuf>,
 ) -> Result<()> {
     let client = Client::try_default()
         .await
@@ -306,9 +342,15 @@ async fn collect(
         node_allocatable,
         measured_node_watts,
         metrics,
+        namespace,
         limit,
         top,
     )?;
+
+    if let Some(path) = sqlite_path {
+        sqlite::save_report(&path, &report)?;
+        return Ok(());
+    }
 
     match output {
         OutputFormat::Table => print_collection_report(&report),
@@ -768,6 +810,7 @@ fn build_collection_report(
     node_allocatable: HashMap<String, f64>,
     measured_node_watts: HashMap<String, f64>,
     metrics: Vec<ContainerMetric>,
+    namespace: Option<&str>,
     workload_limit: Option<usize>,
     top: TopMetric,
 ) -> Result<CollectionReport> {
@@ -783,6 +826,12 @@ fn build_collection_report(
 
     Ok(CollectionReport {
         collected_at_unix_seconds,
+        scope: CollectionScope {
+            namespace: namespace.map(str::to_string),
+            all_namespaces: namespace.is_none(),
+            top: top.as_str().to_string(),
+            limit: workload_limit,
+        },
         telemetry: TelemetryReport {
             prometheus: detection.prometheus_found,
             kepler: detection.kepler_found,
