@@ -1,10 +1,10 @@
 # Visual Showcase & CarbonOps Validation
 
-This directory serves as the visual gallery for **CarbonOps**. It showcases Kubernetes data collection, telemetry detection, and early FinOps plus carbon attribution output across local Kubernetes and AKS validation environments.
+This directory serves as the visual gallery for **CarbonOps**. It showcases Kubernetes infrastructure collection, telemetry detection, and Prometheus/Kepler energy signals across local and cloud Kubernetes validation environments.
 
 ## Milestone 1: Kubernetes Validation
 
-Validate the same CarbonOps collector flow across local Kubernetes and AKS. The screenshots capture telemetry detection, impact per hour, and kube-system metrics output for both measured and estimated telemetry paths.
+Validate the same CarbonOps collector flow across local Kubernetes and AKS. The screenshots capture telemetry detection, impact per hour, and kube-system metrics output for both Prometheus/Kepler and estimated telemetry paths.
 
 ### Local Kubernetes: Measured Telemetry
 
@@ -17,4 +17,3 @@ Local Kubernetes validation with Prometheus and Kepler installed, showing the me
 AKS validation without Prometheus or Kepler installed, showing the estimated CPU-based fallback path.
 
 ![AKS Estimated Fallback](./aks-fallback-detection.png)
-

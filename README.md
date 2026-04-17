@@ -1,14 +1,14 @@
 # CarbonOps
 
-CarbonOps is an experimental Rust CLI for collecting Kubernetes infrastructure data and shaping it into early FinOps plus carbon attribution signals.
+CarbonOps is an experimental Rust CLI for Kubernetes infrastructure observability, collecting workload metrics, node usage, and Prometheus/Kepler energy signals across local and cloud Kubernetes clusters.
 
-The project is focused on learning how local and cloud Kubernetes environments differ in practice: kubeconfig access, Kubernetes API usage, metrics availability, energy telemetry, and workload attribution. It starts with local homelab Kubernetes and extends the same collector flow to AKS.
+The project is focused on learning how local and cloud Kubernetes environments differ in practice: kubeconfig access, Kubernetes API usage, Metrics API availability, Prometheus and Kepler integration, energy telemetry, and workload-to-node mapping.
 
 Cost, energy, and carbon values are estimates unless measured telemetry is available from tools such as Kepler.
 
 ## Milestones
 
-- Validated local Kubernetes with Prometheus/Kepler and AKS without Prometheus/Kepler, proving CarbonOps can use measured energy telemetry when available and fall back to an estimated CPU-based model when needed.
+- Validated the same collector flow across local Kubernetes and AKS, proving CarbonOps can use Prometheus/Kepler telemetry when available and fall back to an estimated CPU-based model when needed.
 - Added scoped collection and top-N workload ranking with `--namespace`, `--all-namespaces`, `--top cpu|memory|cost|carbon`, and `--limit`.
 
 Visual gallery: [`docs/visual-gallery`](docs/visual-gallery)
@@ -20,7 +20,7 @@ CarbonOps currently supports:
 - detecting whether Prometheus and Kepler are available in the current cluster
 - querying Kepler power metrics through Prometheus when available
 - falling back to estimated node energy usage when measured telemetry is unavailable
-- reading Kubernetes node, pod, namespace, and placement data
+- reading Kubernetes node, pod, namespace, and pod-to-node mapping data
 - reading current CPU and memory usage from the Kubernetes Metrics API
 - calculating estimated kWh, CAD cost, and carbon impact per hour
 - showing the telemetry source used for each impact row
@@ -35,7 +35,7 @@ flowchart TD
     C --> D[Kubernetes API]
     C --> E[Metrics API]
     C --> F[Prometheus and Kepler detection]
-    D --> G[Pods, nodes, namespaces, placement]
+    D --> G[Pods, nodes, namespaces, pod-to-node mapping]
     E --> H[CPU and memory usage]
     F --> I{Measured energy available?}
     I -->|yes| J[Kepler node watts]
@@ -59,7 +59,7 @@ For basic collection:
 - `metrics-server` or another provider for the Kubernetes Metrics API
 - RBAC permissions to read pods, nodes, services, and pod metrics
 
-For measured energy attribution:
+For measured energy telemetry:
 
 - Prometheus
 - Kepler
