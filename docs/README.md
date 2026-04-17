@@ -4,4 +4,4 @@
 
 | Domain | Link | Description |
 |--------|------|-------------|
-| Visual gallery | [`visual-gallery`](visual-gallery) | Project screenshots and visual references. |
+| Visual gallery | [`visual-gallery`](visual-gallery) | Kubernetes infrastructure telemetry screenshots and visual references. |
